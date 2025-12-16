@@ -1,0 +1,150 @@
+services:
+  # Zookeeper для Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - flink-network
+
+  # Kafka broker
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    networks:
+      - flink-network
+
+  # PostgreSQL
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: lab3
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - flink-network
+
+  # Flink JobManager
+  jobmanager:
+    container_name: jobmanager
+    hostname: jobmanager
+    command: ["jobmanager"]
+    image: ghcr.io/lakehq/flink:1.17.2-python3.10
+    entrypoint: ["/docker-entrypoint.sh"]
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+      - POSTGRES_URL=postgresql://admin:admin123@postgres:5432/lab3
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin123
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - KAFKA_TOPIC=pet-sales
+    ports: ["8081:8081"]
+    networks:
+      - flink-network
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+
+  # Flink TaskManager
+  taskmanager:
+    container_name: taskmanager
+    image: ghcr.io/lakehq/flink:1.17.2-python3.10
+    hostname: taskmanager
+    command: ["taskmanager"]
+    depends_on: [jobmanager]
+    entrypoint: ["/docker-entrypoint.sh"]
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=4
+      - POSTGRES_URL=postgresql://admin:admin123@postgres:5432/lab3
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin123
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - KAFKA_TOPIC=pet-sales
+    networks:
+      - flink-network
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+
+  # Kafka Producer
+  kafka-producer:
+    build:
+      context: ./kafka_prod
+      dockerfile: Dockerfile
+    container_name: kafka-producer
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: pet-sales
+      MESSAGE_DELAY: "0.05"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - flink-network
+    command: ["python", "producer.py"]
+    restart: on-failure
+
+  # Flink Job Submitter
+  flink-job:
+    build: ./flink_job
+    platform: linux/amd64
+    depends_on:
+      - kafka
+      - postgres
+      - jobmanager
+      - taskmanager
+      - kafka-producer
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        echo "Waiting for Kafka to be ready..."
+        sleep 45
+        echo "Waiting for Flink cluster to be ready..."
+        sleep 15
+        echo "Submitting Flink job..."
+        flink run -m jobmanager:8081 -d --python /opt/flink/job/flink_streaming_job.py
+        echo "Job submitted!"
+    environment:
+      POSTGRES_URL: postgresql://admin:admin123@postgres:5432/lab3
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: pet-sales
+    networks:
+      - flink-network
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+    restart: "no"
+
+networks:
+  flink-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+
